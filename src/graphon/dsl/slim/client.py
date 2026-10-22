@@ -8,9 +8,13 @@ import subprocess  # ruff:ignore[suspicious-subprocess-import]
 import sys
 import tempfile
 from collections.abc import Generator, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import IO, Any
+
+import httpx
 
 from graphon.model_runtime.entities.model_entities import AIModelEntity
 from graphon.model_runtime.utils.encoders import jsonable_encoder
@@ -26,6 +30,64 @@ logger = logging.getLogger(__name__)
 
 _SLIM_BINARY_NAME = "dify-plugin-daemon-slim"
 _SLIM_BINARY_PATH_ENV = "SLIM_BINARY_PATH"
+
+# Remote mode speaks the plugin daemon HTTP API directly, mirroring the Slim
+# binary's remote mode (dify-plugin-daemon pkg/slim/remote.go).
+_DAEMON_DISPATCH_PATH = "/v2/invoke/dispatch"
+_DAEMON_EXTRACT_PATH = "/v2/invoke/extract"
+_DAEMON_EVENT_PREFIX = "data: "
+_NIL_TENANT_ID = "00000000-0000-0000-0000-000000000000"
+_DAEMON_CONNECT_TIMEOUT_SECONDS = 10.0
+_DAEMON_ACTION_PATHS: Mapping[str, str] = MappingProxyType({
+    # tool
+    "invoke_tool": "/tool/invoke",
+    "validate_tool_credentials": "/tool/validate_credentials",
+    "get_tool_runtime_parameters": "/tool/get_runtime_parameters",
+    # model
+    "invoke_llm": "/llm/invoke",
+    "get_llm_num_tokens": "/llm/num_tokens",
+    "invoke_text_embedding": "/text_embedding/invoke",
+    "invoke_multimodal_embedding": "/multimodal_embedding/invoke",
+    "get_text_embedding_num_tokens": "/text_embedding/num_tokens",
+    "invoke_rerank": "/rerank/invoke",
+    "invoke_multimodal_rerank": "/multimodal_rerank/invoke",
+    "invoke_tts": "/tts/invoke",
+    "get_tts_model_voices": "/tts/model/voices",
+    "invoke_speech2text": "/speech2text/invoke",
+    "invoke_moderation": "/moderation/invoke",
+    "validate_provider_credentials": "/model/validate_provider_credentials",
+    "validate_model_credentials": "/model/validate_model_credentials",
+    "get_ai_model_schemas": "/model/schema",
+    # agent strategy
+    "invoke_agent_strategy": "/agent_strategy/invoke",
+    # endpoint
+    "invoke_endpoint": "/endpoint/invoke",
+    # oauth
+    "get_authorization_url": "/oauth/get_authorization_url",
+    "get_credentials": "/oauth/get_credentials",
+    "refresh_credentials": "/oauth/refresh_credentials",
+    "revoke_credentials": "/oauth/revoke_credentials",
+    # datasource
+    "validate_datasource_credentials": "/datasource/validate_credentials",
+    "invoke_website_datasource_get_crawl": "/datasource/get_website_crawl",
+    "invoke_online_document_datasource_get_pages": (
+        "/datasource/get_online_document_pages"
+    ),
+    "invoke_online_document_datasource_get_page_content": (
+        "/datasource/get_online_document_page_content"
+    ),
+    "invoke_online_drive_browse_files": "/datasource/online_drive_browse_files",
+    "invoke_online_drive_download_file": "/datasource/online_drive_download_file",
+    # dynamic parameter
+    "fetch_parameter_options": "/dynamic_select/fetch_parameter_options",
+    # trigger
+    "invoke_trigger_event": "/trigger/invoke_event",
+    "dispatch_trigger_event": "/trigger/dispatch_event",
+    "subscribe_trigger": "/trigger/subscribe",
+    "unsubscribe_trigger": "/trigger/unsubscribe",
+    "refresh_trigger": "/trigger/refresh",
+    "validate_trigger_credentials": "/trigger/validate_credentials",
+})
 
 
 class SlimClientError(RuntimeError):
@@ -121,9 +183,13 @@ class SlimClientConfig:
 class SlimClient:
     config: SlimClientConfig
     binary_path: str | None = None
+    http_client: httpx.Client | None = None
     _binary_path: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.config.mode == "remote":
+            self._binary_path = self.binary_path or ""
+            return
         self._binary_path = self.binary_path or resolve_slim_binary_path()
 
     def cached_plugin_root(self, plugin_id: str) -> Path | None:
@@ -136,6 +202,13 @@ class SlimClient:
         action: str,
         data: Mapping[str, Any],
     ) -> Generator[SlimEvent, None, None]:
+        if self.config.mode == "remote":
+            yield from self._invoke_daemon_events(
+                plugin_id=plugin_id,
+                action=action,
+                data=data,
+            )
+            return
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
             process = subprocess.Popen(  # ruff:ignore[subprocess-without-shell-equals-true]
                 [
@@ -258,6 +331,12 @@ class SlimClient:
         path: str | Path | None = None,
         action: str | None = None,
     ) -> Mapping[str, Any]:
+        if self.config.mode == "remote":
+            return self._extract_from_daemon(
+                plugin_id=plugin_id,
+                path=path,
+                action=action,
+            )
         args = [self._binary_path, "extract", "-output", "json"]
         if plugin_id is not None:
             args.extend(("-id", plugin_id))
@@ -286,6 +365,90 @@ class SlimClient:
             msg = f"Slim extract returned {type(payload).__name__}, expected object."
             raise SlimClientError(msg)
         return payload
+
+    def _invoke_daemon_events(
+        self,
+        *,
+        plugin_id: str,
+        action: str,
+        data: Mapping[str, Any],
+    ) -> Generator[SlimEvent, None, None]:
+        route = _DAEMON_ACTION_PATHS.get(action)
+        if route is None:
+            msg = f"Unknown Slim action: {action}"
+            raise SlimClientError(msg, code="UNKNOWN_ACTION")
+        request_payload = {
+            "tenant_id": _NIL_TENANT_ID,
+            "user_id": "",
+            "data": jsonable_encoder(dict(data)),
+        }
+        with self._daemon_http_client() as client:
+            try:
+                with client.stream(
+                    "POST",
+                    self._daemon_url(_DAEMON_DISPATCH_PATH + route),
+                    json=request_payload,
+                    headers=self._daemon_headers(plugin_id),
+                ) as response:
+                    yield from _read_daemon_events(response)
+            except httpx.HTTPError as error:
+                msg = f"Slim daemon request failed: {error}"
+                raise SlimClientError(msg, code="NETWORK_ERROR") from error
+        yield SlimDoneEvent()
+
+    def _extract_from_daemon(
+        self,
+        *,
+        plugin_id: str | None,
+        path: str | Path | None,
+        action: str | None,
+    ) -> Mapping[str, Any]:
+        if path is not None or action is not None or not plugin_id:
+            msg = "Remote Slim extract supports only plugin_id."
+            raise SlimClientError(msg, code="INVALID_INPUT")
+        with self._daemon_http_client() as client:
+            try:
+                response = client.get(
+                    self._daemon_url(_DAEMON_EXTRACT_PATH),
+                    headers=self._daemon_headers(plugin_id),
+                )
+            except httpx.HTTPError as error:
+                msg = f"Slim daemon request failed: {error}"
+                raise SlimClientError(msg, code="NETWORK_ERROR") from error
+        if response.status_code != httpx.codes.OK:
+            raise _daemon_status_error(response)
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as error:
+            msg = f"Slim daemon returned invalid extract JSON: {error}"
+            raise SlimClientError(msg, code="STREAM_PARSE_ERROR") from error
+        extract_data = _unwrap_remote_daemon_payload(payload)
+        if not isinstance(extract_data, Mapping):
+            msg = f"Slim daemon returned extract data {extract_data!r}."
+            raise SlimClientError(msg, code="STREAM_PARSE_ERROR")
+        return {"tenant_id": _NIL_TENANT_ID, "data": dict(extract_data)}
+
+    @contextmanager
+    def _daemon_http_client(self) -> Generator[httpx.Client]:
+        # An injected client belongs to the caller; only close clients made here.
+        if self.http_client is not None:
+            yield self.http_client
+            return
+        timeout = httpx.Timeout(
+            float(self.config.max_execution_timeout),
+            connect=_DAEMON_CONNECT_TIMEOUT_SECONDS,
+        )
+        with httpx.Client(timeout=timeout) as client:
+            yield client
+
+    def _daemon_url(self, path: str) -> str:
+        return self.config.daemon_addr.rstrip("/") + path
+
+    def _daemon_headers(self, plugin_id: str) -> dict[str, str]:
+        return {
+            "X-Api-Key": self.config.daemon_key,
+            "X-Plugin-Unique-Identifier": plugin_id,
+        }
 
 
 def resolve_slim_binary_path() -> str:
@@ -378,6 +541,32 @@ def _convert_ai_model_entity(
         msg = f"Unsupported Slim model schema: {raw_schema!r}"
         raise SlimClientError(msg)
     return converted
+
+
+def _read_daemon_events(
+    response: httpx.Response,
+) -> Generator[SlimChunkEvent, None, None]:
+    if response.status_code != httpx.codes.OK:
+        response.read()
+        raise _daemon_status_error(response)
+    for line in response.iter_lines():
+        if line.startswith(_DAEMON_EVENT_PREFIX):
+            yield SlimChunkEvent(
+                data=_parse_daemon_event_data(line.removeprefix(_DAEMON_EVENT_PREFIX)),
+            )
+
+
+def _parse_daemon_event_data(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        msg = f"Slim daemon emitted invalid JSON event: {text}"
+        raise SlimClientError(msg, code="STREAM_PARSE_ERROR") from error
+
+
+def _daemon_status_error(response: httpx.Response) -> SlimClientError:
+    msg = f"Slim daemon returned HTTP {response.status_code}: {response.text}"
+    return SlimClientError(msg, code="DAEMON_ERROR")
 
 
 def _iter_slim_events(stdout: Iterable[str]) -> Generator[SlimEvent, None, None]:

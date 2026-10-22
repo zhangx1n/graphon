@@ -28,9 +28,10 @@ cp credentials.example.json credentials.json
 Fill in `credentials.json`. See the [Git ignore rule](../../.gitignore) and
 [PR file check](../../.github/workflows/pr.yml) for local-configuration exclusions.
 
-Provide a Slim executable through `SLIM_BINARY_PATH`, place an executable named
-`slim` in this directory, or put `dify-plugin-daemon-slim` on `PATH`. Both local
-and remote modes require this executable.
+Local mode runs plugins through the Slim executable: provide it through
+`SLIM_BINARY_PATH`, place an executable named `slim` in this directory, or put
+`dify-plugin-daemon-slim` on `PATH`. Remote mode calls the plugin daemon's HTTP
+API directly and needs no executable.
 
 ## DSL Import
 
