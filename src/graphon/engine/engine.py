@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 from collections.abc import Generator, Sequence
+from contextlib import closing
 from typing import final
 
 from graphon.engine_events.base import (
@@ -72,27 +73,28 @@ class Engine:
         """Build an engine for one graph execution.
 
         ``workers`` is the fixed number of node-execution threads owned by this
-        engine. It must be a positive integer; rejecting invalid values before
-        any runtime state is attached avoids creating an engine that can never
-        consume ready tasks.
+        engine. Zero runs every node on the thread that iterates :meth:`run`,
+        for runtimes that cannot start threads. Invalid values are rejected
+        before any runtime state is attached.
 
         Args:
             graph: Graph structure executed by this engine.
             runtime_state: Mutable runtime state associated with ``graph``.
             command_channel: External command source for pause, abort, and updates.
                 A process-local in-memory channel is created when omitted.
-            workers: Fixed number of worker threads to create while running.
+            workers: Fixed number of worker threads to create while running, or
+                zero to run nodes on the calling thread.
             container_handler_factories: Additional container handler factories.
             file_runtime: File adapter for this execution. None captures the
                 current scoped adapter, even if it is unconfigured.
                 Supply it again when rebuilding an engine from a snapshot.
 
         Raises:
-            ValueError: If ``workers`` is not a positive integer.
+            ValueError: If ``workers`` is not a non-negative integer.
 
         """
-        if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
-            msg = "workers must be a positive integer"
+        if not isinstance(workers, int) or isinstance(workers, bool) or workers < 0:
+            msg = "workers must be a non-negative integer"
             raise ValueError(msg)
 
         # Bind runtime state to current workflow context
@@ -105,6 +107,7 @@ class Engine:
             command_channel if command_channel is not None else InMemoryChannel()
         )
         self._layers: list[Layer] = []
+        self._runs_inline = workers == 0
 
         # Graph execution tracks the overall execution state
         self._graph_execution = self._runtime_state.graph_execution
@@ -273,7 +276,14 @@ class Engine:
         self._event_stream.notify_layers(started_event)
         yield started_event
         self._start_execution(resume=resume)
-        yield from self._event_stream.emit_events()
+        if self._runs_inline:
+            with closing(self._dispatcher.run_inline()) as dispatch_steps:
+                for _ in dispatch_steps:
+                    yield from self._event_stream.drain_events()
+            yield from self._event_stream.drain_events()
+        else:
+            self._dispatcher.start()
+            yield from self._event_stream.emit_events()
         yield from self._emit_terminal_events()
 
     def _emit_terminal_events(self) -> Generator[EngineEvent, None, None]:
@@ -335,7 +345,11 @@ class Engine:
                 )
 
     def _start_execution(self, *, resume: bool) -> None:  # ruff:ignore[complex-structure]
-        """Start execution subsystems."""
+        """Start workers and schedule the first ready tasks.
+
+        The caller starts dispatch afterwards: the dispatcher thread for
+        threaded engines, or :meth:`Dispatcher.run_inline` for zero workers.
+        """
         ready_tasks = []
         if resume:
             for frame_state in self._runtime_state.container_frames():
@@ -379,8 +393,6 @@ class Engine:
         else:
             root_node = self._graph.root_node
             self._scheduler.enqueue_node(root_node.id)
-
-        self._dispatcher.start()
 
     def _stop_execution(self) -> None:
         """Stop execution subsystems."""

@@ -41,10 +41,13 @@ from tests.helpers.workflow_events import (
     fake_slim_llm,
     final_outputs,
     run_workflow,
+    threads_forbidden_if_inline,
 )
 
 _OPENAI_PLUGIN_ID = "langgenius/openai:0.3.8@test"
 _ENGINE_TIMEOUT_SECONDS = 2
+# Threaded and single-threaded inline execution must produce the same events.
+_ENGINE_MODES = pytest.mark.parametrize("workers", [5, 0], ids=["threads", "inline"])
 
 
 def _graph_dsl(
@@ -138,11 +141,13 @@ def _run_failed_workflow(
     dsl: str,
     *,
     start_inputs: Mapping[str, object],
+    workers: int = 5,
 ) -> list[EngineEvent]:
     events: list[EngineEvent] = []
-    engine = loads(dsl, start_inputs=start_inputs)
-    with pytest.raises(RuntimeError, match="Variable"):
-        events.extend(engine.run())
+    with threads_forbidden_if_inline(workers):
+        engine = loads(dsl, start_inputs=start_inputs, workers=workers)
+        with pytest.raises(RuntimeError, match="Variable"):
+            events.extend(engine.run())
     return events
 
 
@@ -219,7 +224,8 @@ def _openai_credentials() -> Mapping[str, Any]:
     }
 
 
-def test_full_answer_graph_is_verified_from_events() -> None:
+@_ENGINE_MODES
+def test_full_answer_graph_is_verified_from_events(workers: int) -> None:
     dsl = _graph_dsl(
         nodes=[
             _start_node(),
@@ -231,7 +237,7 @@ def test_full_answer_graph_is_verified_from_events() -> None:
         edges=[_edge("start", "answer")],
     )
 
-    events = run_workflow(dsl, start_inputs={"name": "Graphon"})
+    events = run_workflow(dsl, workers=workers, start_inputs={"name": "Graphon"})
 
     assert event_path(events) == [
         _event("GraphRunStartedEvent"),
@@ -300,10 +306,13 @@ def test_resume_replays_tasks_through_a_bounded_ready_queue() -> None:
     assert isinstance(events[-1], GraphRunSucceededEvent)
 
 
-def test_full_iteration_graph_records_process_and_final_outputs() -> None:
+@_ENGINE_MODES
+def test_full_iteration_graph_records_process_and_final_outputs(workers: int) -> None:
     dsl = _iteration_dsl(is_parallel=False, parallel_nums=1)
 
-    events = run_workflow(dsl, start_inputs={"items": ["alpha", "beta"]})
+    events = run_workflow(
+        dsl, workers=workers, start_inputs={"items": ["alpha", "beta"]}
+    )
 
     assert event_path(events) == [
         _event("GraphRunStartedEvent"),
@@ -777,7 +786,8 @@ def test_nested_containers_preserve_external_updates_and_iteration_isolation() -
     assert final_outputs(events) == {"counter": 11}
 
 
-def test_full_loop_graph_stops_at_loop_end_node() -> None:
+@_ENGINE_MODES
+def test_full_loop_graph_stops_at_loop_end_node(workers: int) -> None:
     dsl = _graph_dsl(
         nodes=[
             _start_node(),
@@ -808,7 +818,7 @@ def test_full_loop_graph_stops_at_loop_end_node() -> None:
         ],
     )
 
-    events = run_workflow(dsl)
+    events = run_workflow(dsl, workers=workers)
 
     assert event_path(events) == [
         _event("GraphRunStartedEvent"),
@@ -883,7 +893,8 @@ def test_full_loop_graph_uses_custom_container_handler_factory() -> None:
     assert any(isinstance(event, NodeRunLoopSucceededEvent) for event in events)
 
 
-def test_nested_iteration_loop_end_stops_ancestor_loop() -> None:
+@_ENGINE_MODES
+def test_nested_iteration_loop_end_stops_ancestor_loop(workers: int) -> None:
     dsl = _graph_dsl(
         nodes=[
             _start_node(),
@@ -939,7 +950,7 @@ def test_nested_iteration_loop_end_stops_ancestor_loop() -> None:
         ],
     )
 
-    events = run_workflow(dsl, start_inputs={"items": ["only"]})
+    events = run_workflow(dsl, workers=workers, start_inputs={"items": ["only"]})
 
     stop_succeeded = next(
         event
@@ -958,7 +969,8 @@ def test_nested_iteration_loop_end_stops_ancestor_loop() -> None:
     assert len(iteration_succeeded) == 1
 
 
-def test_loop_condition_error_uses_node_failure_lifecycle() -> None:
+@_ENGINE_MODES
+def test_loop_condition_error_uses_node_failure_lifecycle(workers: int) -> None:
     dsl = _graph_dsl(
         nodes=[
             _start_node(),
@@ -986,7 +998,7 @@ def test_loop_condition_error_uses_node_failure_lifecycle() -> None:
         edges=[_edge("start", "loop")],
     )
 
-    events = _run_failed_workflow(dsl, start_inputs={})
+    events = _run_failed_workflow(dsl, workers=workers, start_inputs={})
 
     assert event_path(events)[-3:] == [
         _event("NodeRunLoopFailedEvent", "loop"),
@@ -1080,6 +1092,7 @@ def test_full_loop_graph_propagates_child_failure() -> None:
     assert engine.runtime_state.outputs == {}
 
 
+@_ENGINE_MODES
 @pytest.mark.parametrize(
     ("items", "flatten_output", "expected_output"),
     [
@@ -1092,6 +1105,7 @@ def test_full_iteration_graph_handles_empty_and_nested_outputs(
     items: list[object],
     flatten_output: bool,
     expected_output: list[object],
+    workers: int,
 ) -> None:
     dsl = _graph_dsl(
         nodes=[
@@ -1130,7 +1144,7 @@ def test_full_iteration_graph_handles_empty_and_nested_outputs(
         ],
     )
 
-    events = run_workflow(dsl, start_inputs={"items": items})
+    events = run_workflow(dsl, workers=workers, start_inputs={"items": items})
     expected_path = [
         _event("GraphRunStartedEvent"),
         _event("NodeRunStartedEvent", "start"),
@@ -1163,6 +1177,7 @@ def test_full_iteration_graph_handles_empty_and_nested_outputs(
     assert final_outputs(events) == {"items": expected_output}
 
 
+@_ENGINE_MODES
 @pytest.mark.parametrize(
     ("error_handle_mode", "expected_output"),
     [
@@ -1174,6 +1189,7 @@ def test_full_iteration_graph_handles_empty_and_nested_outputs(
 def test_full_iteration_graph_applies_error_handling_mode(
     error_handle_mode: str,
     expected_output: list[object],
+    workers: int,
 ) -> None:
     dsl = _graph_dsl(
         nodes=[
@@ -1232,9 +1248,9 @@ def test_full_iteration_graph_applies_error_handling_mode(
     )
     start_inputs = {"items": ["a", "b"]}
     events = (
-        _run_failed_workflow(dsl, start_inputs=start_inputs)
+        _run_failed_workflow(dsl, workers=workers, start_inputs=start_inputs)
         if error_handle_mode == "terminated"
-        else run_workflow(dsl, start_inputs=start_inputs)
+        else run_workflow(dsl, workers=workers, start_inputs=start_inputs)
     )
     executed_items = 1 if error_handle_mode == "terminated" else 2
     expected_path = [
@@ -1306,8 +1322,10 @@ def test_full_iteration_graph_applies_error_handling_mode(
     assert event_path(events) == expected_path
 
 
+@_ENGINE_MODES
 def test_full_llm_graph_uses_mocked_slim_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    workers: int,
 ) -> None:
     fake_llm = fake_slim_llm(
         monkeypatch,
@@ -1346,6 +1364,7 @@ def test_full_llm_graph_uses_mocked_slim_runtime(
 
     events = run_workflow(
         dsl,
+        workers=workers,
         credentials=_openai_credentials(),
         start_inputs={"query": "Graphon"},
     )

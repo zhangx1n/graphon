@@ -143,38 +143,53 @@ class Worker(threading.Thread):
                     continue
                 self._has_current_task.set()
             try:
-                self._execute_task(task)
-            except Exception as e:
-                if self._current_node is None:
-                    raise
-                node = self._current_node
-                logger.exception(
-                    "Worker failed while executing node %s",
-                    node.id,
-                )
-                self._dispatch_queue.put(
-                    NodeEventTask(
-                        frame_id=self._current_frame_id,
-                        event=self._build_fallback_failure_event(
-                            node,
-                            e,
-                            started_at=self._current_node_started_at,
-                        ),
-                    )
-                )
+                for dispatch_task in self.run_task(task):
+                    self._dispatch_queue.put(dispatch_task)
             finally:
-                self._ready_queue.task_done()
-                self._current_node_started_at = None
-                self._current_node = None
-                self._current_frame_id = ROOT_FRAME_ID
                 self._has_current_task.clear()
 
-    def _execute_task(self, task: ReadyTask) -> None:
+    def run_task(self, task: ReadyTask) -> Generator[DispatchTask, None, None]:
+        """Execute one acquired ready task, yielding dispatch work as it occurs.
+
+        Each node event or container await request is yielded as soon as the
+        node produces it. Worker threads enqueue the yielded tasks; inline
+        execution dispatches them on the calling thread. The ready-queue task is
+        marked done exactly once, including when the caller closes the generator.
+
+        Yields:
+            Dispatch tasks produced while executing ``task``.
+
+        """
+        try:
+            yield from self._execute_task(task)
+        except Exception as e:
+            if self._current_node is None:
+                raise
+            node = self._current_node
+            logger.exception(
+                "Worker failed while executing node %s",
+                node.id,
+            )
+            yield NodeEventTask(
+                frame_id=self._current_frame_id,
+                event=self._build_fallback_failure_event(
+                    node,
+                    e,
+                    started_at=self._current_node_started_at,
+                ),
+            )
+        finally:
+            self._ready_queue.task_done()
+            self._current_node_started_at = None
+            self._current_node = None
+            self._current_frame_id = ROOT_FRAME_ID
+
+    def _execute_task(self, task: ReadyTask) -> Generator[DispatchTask, None, None]:
         if isinstance(task, StartTask):
             self._current_frame_id = task.frame_id
             node = self._frame_registry[task.frame_id].graph.nodes[task.node_id]
             self._current_node = node
-            self._execute_node(frame_id=task.frame_id, node=node)
+            yield from self._execute_node(frame_id=task.frame_id, node=node)
             return
         root_runtime_state = self._frame_registry[ROOT_FRAME_ID].state
         run_state = root_runtime_state.get_container_run(task.invocation_id)
@@ -184,7 +199,7 @@ class Worker(threading.Thread):
         self._current_node = node
         self._current_node_started_at = run_state.started_at
         try:
-            suspended = self._run_node_events(
+            suspended = yield from self._run_node_events(
                 invocation_id=run_state.invocation_id,
                 node=node,
                 node_events=node.resume_container(
@@ -199,16 +214,25 @@ class Worker(threading.Thread):
             return
         root_runtime_state.pop_container_run(run_state.invocation_id)
 
-    def _execute_node(self, *, frame_id: str, node: Node) -> None:
-        """Execute a single node and handle its events.
+    def _execute_node(
+        self,
+        *,
+        frame_id: str,
+        node: Node,
+    ) -> Generator[DispatchTask, None, None]:
+        """Execute a single node and yield its dispatch tasks.
 
         Args:
+            frame_id: Frame that owns the node.
             node: The node instance to execute
+
+        Yields:
+            Dispatch tasks produced by the node.
 
         """
         self._bind_execution_id(frame_id=frame_id, node=node)
 
-        self._run_node_events(
+        yield from self._run_node_events(
             invocation_id=None,
             node=node,
             node_events=node.run(),
@@ -228,7 +252,7 @@ class Worker(threading.Thread):
         invocation_id: str | None,
         node: Node,
         node_events: Iterator[NodeEvent | ContainerAwaitRequest],
-    ) -> bool:
+    ) -> Generator[DispatchTask, None, bool]:
         error: Exception | None = None
         result_event: NodeEvent | None = None
         suspended = False
@@ -242,7 +266,7 @@ class Worker(threading.Thread):
             if invocation_id is None:
                 self._invoke_node_run_start_hooks(node)
             try:
-                result_event, suspended = self._consume_node_events(
+                result_event, suspended = yield from self._consume_node_events(
                     invocation_id=invocation_id,
                     node=node,
                     node_events=node_events,
@@ -251,7 +275,7 @@ class Worker(threading.Thread):
                 error = exc
                 raise
             else:
-                return suspended
+                return suspended  # ruff: ignore[return-in-generator]
             finally:
                 if not suspended:
                     self._invoke_node_run_end_hooks(node, error, result_event)
@@ -307,7 +331,7 @@ class Worker(threading.Thread):
         invocation_id: str | None,
         node: Node,
         node_events: Iterator[NodeEvent | ContainerAwaitRequest],
-    ) -> tuple[NodeEvent | None, bool]:
+    ) -> Generator[DispatchTask, None, tuple[NodeEvent | None, bool]]:
         result_event: NodeEvent | None = None
         for event in node_events:
             if isinstance(event, ContainerAwaitRequest):
@@ -327,21 +351,17 @@ class Worker(threading.Thread):
                             request=event,
                         )
                     )
-                self._dispatch_queue.put(
-                    ContainerAwaitTask(
-                        invocation_id=invocation_id,
-                        request=event,
-                    )
+                yield ContainerAwaitTask(
+                    invocation_id=invocation_id,
+                    request=event,
                 )
                 return None, True
             if isinstance(event, NodeRunStartedEvent) and event.id == node.execution_id:
                 self._current_node_started_at = event.start_at
-            self._dispatch_queue.put(
-                NodeEventTask(frame_id=self._current_frame_id, event=event)
-            )
+            yield NodeEventTask(frame_id=self._current_frame_id, event=event)
             if is_node_result_event(event):
                 result_event = event
-        return result_event, False
+        return result_event, False  # ruff: ignore[return-in-generator]
 
     def _invoke_node_run_start_hooks(self, node: Node) -> None:
         """Invoke on_node_run_start hooks for all layers."""

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import threading
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import contextmanager
 from types import MappingProxyType
 from typing import Any, ClassVar
+from unittest import mock
 
 import pytest
 
@@ -12,7 +15,11 @@ from graphon.engine_events.base import EngineEvent, NodeEvent
 from graphon.engine_events.graph import GraphRunSucceededEvent
 from graphon.engine_events.traversal import GraphEdgeTakenEvent
 from graphon.model_runtime.entities.common_entities import I18nObject
-from graphon.model_runtime.entities.llm_entities import LLMResult, LLMUsage
+from graphon.model_runtime.entities.llm_entities import (
+    LLMResult,
+    LLMResultChunk,
+    LLMUsage,
+)
 from graphon.model_runtime.entities.message_entities import (
     AssistantPromptMessage,
     PromptMessage,
@@ -96,7 +103,7 @@ class FakeSlimLLM:
         tools: Sequence[PromptMessageTool] | None,
         stop: Sequence[str] | None,
         stream: bool,
-    ) -> LLMResult:
+    ) -> LLMResult | Generator[LLMResultChunk, None, None]:
         stop_values: Sequence[str] = ()
         if stop is not None:
             stop_values = list(stop)
@@ -134,18 +141,42 @@ def fake_slim_llm(
     return FakeSlimLLM
 
 
+@contextmanager
+def threads_forbidden() -> Generator[None]:
+    """Fail like single-threaded runtimes such as Pyodide when a thread starts."""
+    with mock.patch.object(
+        threading.Thread,
+        "start",
+        side_effect=RuntimeError("can't start new thread"),
+    ) as start:
+        yield
+    start.assert_not_called()
+
+
+@contextmanager
+def threads_forbidden_if_inline(workers: int) -> Generator[None]:
+    if workers == 0:
+        with threads_forbidden():
+            yield
+    else:
+        yield
+
+
 def run_workflow(
     dsl: str,
     *,
     start_inputs: Mapping[str, Any] = _EMPTY_MAPPING,
     credentials: Mapping[str, Any] = _EMPTY_MAPPING,
+    workers: int = 5,
 ) -> list[EngineEvent]:
-    engine = loads(
-        dsl,
-        start_inputs=dict(start_inputs),
-        credentials=dict(credentials),
-    )
-    return list(engine.run())
+    with threads_forbidden_if_inline(workers):
+        engine = loads(
+            dsl,
+            start_inputs=dict(start_inputs),
+            credentials=dict(credentials),
+            workers=workers,
+        )
+        return list(engine.run())
 
 
 def event_path(

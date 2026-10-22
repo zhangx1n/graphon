@@ -527,7 +527,7 @@ def test_command_processor_directly_handles_builtin_commands() -> None:
     assert str(execution.error) == "Aborted: stop"
 
 
-@pytest.mark.parametrize("workers", [0, True, 1.5])
+@pytest.mark.parametrize("workers", [-1, True, 1.5])
 def test_engine_rejects_invalid_workers_before_mutating_runtime_state(
     workers: Any,
 ) -> None:
@@ -539,7 +539,7 @@ def test_engine_rejects_invalid_workers_before_mutating_runtime_state(
     """
     runtime_state = MagicMock()
 
-    with pytest.raises(ValueError, match="workers must be a positive integer"):
+    with pytest.raises(ValueError, match="workers must be a non-negative integer"):
         Engine(
             graph=MagicMock(),
             runtime_state=runtime_state,
@@ -549,19 +549,21 @@ def test_engine_rejects_invalid_workers_before_mutating_runtime_state(
     runtime_state.attach_graph.assert_not_called()
 
 
-def test_worker_pool_rejects_zero_workers() -> None:
-    """Reject a directly constructed pool that could never acquire queued work.
+@pytest.mark.parametrize("workers", [-1, True, 1.5])
+def test_worker_pool_rejects_invalid_workers(workers: Any) -> None:
+    """Reject a directly constructed pool with an impossible worker count.
 
     Direct callers bypass ``Engine`` validation, so the pool must enforce
-    the same positive-worker invariant before retaining any collaborators.
+    the same non-negative invariant before retaining any collaborators. Zero
+    means the engine runs tasks on its calling thread.
     """
-    with pytest.raises(ValueError, match="workers must be a positive integer"):
+    with pytest.raises(ValueError, match="workers must be a non-negative integer"):
         WorkerPool(
             ready_queue=MagicMock(),
             dispatch_queue=MagicMock(),
             frame_registry=MagicMock(),
             layers=[],
-            workers=0,
+            workers=workers,
         )
 
 

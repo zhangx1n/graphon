@@ -81,3 +81,24 @@ class EventStream:
         events = self._events
         while (event := events.get()) is not _COMPLETE:
             yield cast(EngineEvent, event)
+
+    def drain_events(self) -> Generator[EngineEvent, None, None]:
+        """Yield the events collected so far without waiting for more.
+
+        Single-threaded execution produces and consumes events on one thread, so
+        it cannot block for future events. Draining stops at the completion
+        marker, matching :meth:`emit_events`.
+
+        Yields:
+            EngineEvent instances already collected.
+
+        """
+        events = self._events
+        while True:
+            try:
+                event = events.get_nowait()
+            except queue.Empty:
+                return
+            if event is _COMPLETE:
+                return
+            yield cast(EngineEvent, event)

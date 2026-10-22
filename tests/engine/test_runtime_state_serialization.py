@@ -80,7 +80,7 @@ from graphon.runtime.init_params import InitParams
 from graphon.runtime.runtime_state import RuntimeState
 from graphon.runtime.variable_pool import VariablePool
 from graphon.variables.segments import StringSegment
-from tests.helpers.workflow_events import final_outputs
+from tests.helpers.workflow_events import final_outputs, threads_forbidden_if_inline
 
 _V2_PAUSED_LOOP_SNAPSHOT = (
     Path(__file__).with_name("fixtures") / "runtime_state_v2_1d0f32c_paused_loop.json"
@@ -267,6 +267,7 @@ def _hitl_engine(
     *,
     runtime_state: RuntimeState,
     callback: HITLCallback,
+    workers: int = 2,
 ) -> Engine:
     plan = inspect(dsl)
     graph_config = plan.document.graph_config
@@ -297,14 +298,16 @@ def _hitl_engine(
     return Engine(
         graph=graph,
         runtime_state=runtime_state,
-        workers=2,
+        workers=workers,
     )
 
 
 def _snapshot_after_hitl_pause(
     engine: Engine,
+    workers: int = 2,
 ) -> tuple[str, list[EngineEvent]]:
-    events = list(engine.run())
+    with threads_forbidden_if_inline(workers):
+        events = list(engine.run())
     assert any(isinstance(event, NodeRunPauseRequestedEvent) for event in events)
     assert any(isinstance(event, GraphRunPausedEvent) for event in events)
     return engine.runtime_state.dumps(), events
@@ -837,7 +840,8 @@ def test_loop_frame_restore_copies_parent_variable_pool() -> None:
     assert parent_seed.to_object() == "parent"
 
 
-def test_loop_hitl_runtime_state_round_trip_preserves_progress() -> None:
+@pytest.mark.parametrize("workers", [2, 0], ids=["threads", "inline"])
+def test_loop_hitl_runtime_state_round_trip_preserves_progress(workers: int) -> None:
     completed_rounds = 0
 
     def pause_after_one_round(context: HITLContext) -> Completed | PauseRequested:
@@ -852,19 +856,22 @@ def test_loop_hitl_runtime_state_round_trip_preserves_progress() -> None:
             _loop_dsl(),
             runtime_state=_new_runtime_state({}),
             callback=pause_after_one_round,
-        )
+            workers=workers,
+        ),
+        workers,
     )
     paused_state = RuntimeState.from_snapshot(snapshot)
     run_state = paused_state.container_runs()[0]
     frame_state = paused_state.container_frames()[0]
     deferred_tasks = paused_state.take_deferred_ready_tasks()
-    resumed_events = list(
-        _hitl_engine(
-            _loop_dsl(),
-            runtime_state=RuntimeState.from_snapshot(snapshot),
-            callback=_complete_loop_hitl,
-        ).run()
+    resumed_engine = _hitl_engine(
+        _loop_dsl(),
+        runtime_state=RuntimeState.from_snapshot(snapshot),
+        callback=_complete_loop_hitl,
+        workers=workers,
     )
+    with threads_forbidden_if_inline(workers):
+        resumed_events = list(resumed_engine.run())
     pause_requests = [
         event
         for event in paused_events
@@ -986,7 +993,8 @@ def test_version_1_child_task_is_rejected_before_worker_start() -> None:
     ]
 
 
-def test_paused_engine_can_resume_same_instance() -> None:
+@pytest.mark.parametrize("workers", [2, 0], ids=["threads", "inline"])
+def test_paused_engine_can_resume_same_instance(workers: int) -> None:
     callback_count = 0
 
     def pause_second_round(context: HITLContext) -> Completed | PauseRequested:
@@ -1000,10 +1008,12 @@ def test_paused_engine_can_resume_same_instance() -> None:
         _loop_dsl(),
         runtime_state=_new_runtime_state({}),
         callback=pause_second_round,
+        workers=workers,
     )
 
-    paused_events = list(engine.run())
-    resumed_events = list(engine.run())
+    with threads_forbidden_if_inline(workers):
+        paused_events = list(engine.run())
+        resumed_events = list(engine.run())
 
     assert isinstance(paused_events[-1], GraphRunPausedEvent)
     assert isinstance(resumed_events[0], GraphRunStartedEvent)

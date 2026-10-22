@@ -71,7 +71,10 @@ flowchart LR
 2. [Engine](src/graphon/engine/engine.py) binds a root frame, command processor,
    event stream, fixed worker pool, and dispatcher. Calling `run()` starts or
    resumes execution and yields graph lifecycle events plus processed node and
-   traversal events.
+   traversal events. `workers=0` starts no threads: the
+   [dispatcher](src/graphon/engine/dispatcher.py) runs one task at a time on the
+   consumer's thread and yields after each node event, for runtimes such as
+   Pyodide; see [inline execution tests](tests/engine/test_inline_execution.py).
 3. [Scheduler](src/graphon/engine/scheduler.py) queues frame-qualified `StartTask`
    values. [Workers](src/graphon/engine/worker/worker.py) bind execution IDs,
    execute node generators inside [layer task contexts](src/graphon/engine/layer/README.md),

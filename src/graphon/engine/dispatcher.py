@@ -1,8 +1,10 @@
 """Dispatch worker results onto the engine's state-transition thread."""
 
+import contextvars
 import logging
 import queue
 import threading
+from collections.abc import Generator
 from typing import final
 
 from graphon.engine_events.base import NodeEvent
@@ -15,6 +17,7 @@ from graphon.engine_events.node import (
 from graphon.file.protocols import WorkflowFileRuntimeProtocol
 from graphon.file.runtime import use_workflow_file_runtime
 from graphon.runtime.execution import GraphExecution
+from graphon.runtime.ready_queue import ReadyTask
 
 from .command.processor import CommandProcessor
 from .event.processor import NodeEventProcessor
@@ -95,6 +98,73 @@ class Dispatcher:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
 
+    def run_inline(self) -> Generator[None, None, None]:
+        """Run ready tasks and dispatch their results on the calling thread.
+
+        This replaces the worker and dispatcher threads for zero-worker engines.
+        It yields after every dispatched task so the caller can deliver the
+        events collected so far before the node continues. Tasks run one at a
+        time; a pause or abort takes effect once the active task finishes.
+
+        Yields:
+            None after each dispatched task.
+
+        """
+        try:
+            paused = yield from self._run_ready_tasks_inline()
+            self._process_commands()
+            if (
+                paused
+                and not self._graph_execution.aborted
+                and self._graph_execution.error is None
+            ):
+                self._event_processor.snapshot_frames()
+        except Exception as error:
+            logger.exception("Inline dispatch error")
+            self._graph_execution.fail(error)
+        finally:
+            self._publish_completion()
+
+    def _run_ready_tasks_inline(self) -> Generator[None, None, bool]:
+        while True:
+            self._process_commands()
+            if (
+                self._graph_execution.aborted
+                or self._graph_execution.error is not None
+                or self._scheduler.is_execution_complete()
+            ):
+                return False
+            if self._graph_execution.paused:
+                self._scheduler.defer_ready_tasks(self._worker_pool.pause())
+                return True  # ruff: ignore[return-in-generator]
+            yield from self._run_task_inline(self._take_ready_task_inline())
+
+    def _take_ready_task_inline(self) -> ReadyTask:
+        # Without worker threads nothing else can enqueue work, so an empty
+        # queue in an unfinished execution would otherwise wait forever.
+        task = self._worker_pool.take_ready_task()
+        if task is None:
+            msg = "Graph execution stalled: no node is ready to run."
+            raise RuntimeError(msg)
+        return task
+
+    def _run_task_inline(self, task: ReadyTask) -> Generator[None, None, None]:
+        # Advance the node in its own context so layer context variables entered
+        # by the worker do not leak into dispatch or the event consumer.
+        context = contextvars.copy_context()
+        dispatch_tasks = self._worker_pool.run_task(task)
+        try:
+            while True:
+                try:
+                    dispatch_task = context.run(dispatch_tasks.__next__)
+                except StopIteration:
+                    return
+                event = self._dispatch_task(dispatch_task)
+                self._process_commands(event)
+                yield
+        finally:
+            context.run(dispatch_tasks.close)
+
     def _dispatcher_loop(self) -> None:
         """Main dispatcher loop."""
         with (
@@ -112,9 +182,12 @@ class Dispatcher:
             logger.exception("Dispatcher error")
             self._graph_execution.fail(error)
         finally:
-            if not self._graph_execution.paused and not self._graph_execution.completed:
-                self._graph_execution.complete()
-            self._event_stream.mark_complete()
+            self._publish_completion()
+
+    def _publish_completion(self) -> None:
+        if not self._graph_execution.paused and not self._graph_execution.completed:
+            self._graph_execution.complete()
+        self._event_stream.mark_complete()
 
     def _run_until_exit(self) -> bool:
         self._process_commands()

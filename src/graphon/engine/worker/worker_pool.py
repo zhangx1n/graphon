@@ -3,6 +3,7 @@
 import logging
 import queue
 import threading
+from collections.abc import Generator
 from typing import final
 
 from graphon.engine.frame import FrameRegistry
@@ -17,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 @final
 class WorkerPool:
-    """Manage the fixed number of workers configured for an engine."""
+    """Manage the fixed number of workers configured for an engine.
+
+    A pool with zero workers starts no threads. Its caller acquires ready tasks
+    with :meth:`take_ready_task` and runs them with :meth:`run_task`.
+    """
 
     def __init__(
         self,
@@ -35,15 +40,16 @@ class WorkerPool:
             dispatch_queue: Queue for worker dispatch tasks.
             frame_registry: Registry containing frame-local graphs to execute
             layers: Engine layers for node execution hooks
-            workers: Fixed number of worker threads to create
+            workers: Fixed number of worker threads to create. Zero means the
+                caller runs tasks on its own thread.
             file_runtime: File adapter supplied by the engine.
 
         Raises:
-            ValueError: If ``workers`` is not a positive integer.
+            ValueError: If ``workers`` is not a non-negative integer.
 
         """
-        if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
-            msg = "workers must be a positive integer"
+        if not isinstance(workers, int) or isinstance(workers, bool) or workers < 0:
+            msg = "workers must be a non-negative integer"
             raise ValueError(msg)
 
         self._ready_queue = ready_queue
@@ -58,6 +64,8 @@ class WorkerPool:
         self._lock = threading.Lock()
         self._task_acquisition_lock = threading.Lock()
         self._task_acquisition_enabled = threading.Event()
+        # Runs tasks for zero-worker pools; never started as a thread.
+        self._caller_worker: Worker | None = None
 
     def start(self) -> None:
         """Start the worker pool."""
@@ -110,6 +118,32 @@ class WorkerPool:
                     if not worker.has_current_task:
                         worker.stop()
             return pending_tasks
+
+    def take_ready_task(self) -> ReadyTask | None:
+        """Return the next ready task without waiting, or None when none is ready."""
+        try:
+            return self._ready_queue.get(timeout=0)
+        except queue.Empty:
+            return None
+
+    def run_task(self, task: ReadyTask) -> Generator[DispatchTask, None, None]:
+        """Run one task from :meth:`take_ready_task` on the calling thread.
+
+        Returns:
+            Generator yielding dispatch tasks as the node produces them.
+
+        """
+        if self._caller_worker is None:
+            self._caller_worker = Worker(
+                ready_queue=self._ready_queue,
+                dispatch_queue=self._dispatch_queue,
+                frame_registry=self._frame_registry,
+                layers=self._layers,
+                file_runtime=self._file_runtime,
+                task_acquisition_lock=self._task_acquisition_lock,
+                task_acquisition_enabled=self._task_acquisition_enabled,
+            )
+        return self._caller_worker.run_task(task)
 
     def has_current_tasks(self) -> bool:
         with self._lock:

@@ -116,7 +116,9 @@ class NodeFailureHandler:
         """
         node = self._graph.nodes[event.node_id]
 
-        time.sleep(node.retry_config.retry_interval_seconds)
+        retry_interval_seconds = node.retry_config.retry_interval_seconds
+        if retry_interval_seconds > 0:
+            time.sleep(retry_interval_seconds)
         return NodeRunRetryEvent(
             id=event.id,
             node_title=node.title,
