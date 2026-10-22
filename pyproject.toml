@@ -5,29 +5,36 @@ description = 'Graph execution engine for agentic AI workflows.'
 readme = 'README.md'
 license = 'Apache-2.0'
 license-files = ['LICENSE']
-# Keep Python support aligned with `unstructured`, which currently declares
-# `Requires-Python: <3.14,>=3.11`.
-requires-python = '>=3.12,<3.14'
+requires-python = '>=3.12,<3.15'
 dependencies = [
     'charset-normalizer>=2.1',
-    'defusedxml>=0.7',
     'httpx>=0.28',
     'json-repair>=0.55',
     'jsonschema>=4.18',
-    'odfdo>=3.22.8',
     'orjson>=3',
-    'pandas[excel]>=2.1',
     'pydantic>=2.7',
     'pydantic-extra-types>=2',
+    'pyyaml>=6',
+    'tiktoken>=0.12',
+    'typing-extensions>=4.10.0',
+]
+
+[project.optional-dependencies]
+# Document extraction node. `unstructured` supports Python <3.14 only, so its
+# legacy Office, HTML, Markdown, and email formats are unavailable on 3.14.
+documents = [
+    'defusedxml>=0.7',
+    'odfdo>=3.22.8',
+    'pandas[excel]>=2.1',
     'pypdf>=6.19.0',
     'pypdfium2>=5',
     'python-docx>=1.2',
-    'pyyaml>=6',
-    'tiktoken>=0.12',
-    'transformers>=4',
-    'typing-extensions>=4.10.0',
-    'unstructured[docx,md,ppt,pptx]>=0.21',
+    "unstructured[docx,md,ppt,pptx]>=0.21; python_version < '3.14'",
     'webvtt-py>=0.5',
+]
+# Fallback GPT-2 tokenizer used only when tiktoken cannot load.
+transformers = [
+    'transformers>=4',
 ]
 
 [project.urls]
@@ -37,6 +44,7 @@ issues = 'https://github.com/langgenius/graphon/issues'
 
 [dependency-groups]
 dev = [
+    'graphon[documents,transformers]',
     'pytest',
     'pytest-benchmark',
     'pytest-cov',

@@ -45,3 +45,50 @@ def test_runtime_snapshot_round_trip_does_not_load_engine_or_register_nodes() ->
         """
     )
     subprocess.run([sys.executable, "-c", script], check=True)  # ruff: ignore[subprocess-without-shell-equals-true]
+
+
+def test_dsl_runs_without_optional_document_and_tokenizer_packages() -> None:
+    """Core installs omit the ``documents`` and ``transformers`` extras.
+
+    Single-threaded runtimes such as Pyodide cannot install those packages, so
+    importing the DSL and running a graph inline must not load them.
+    """
+    script = dedent(
+        """
+        import importlib.abc
+        import sys
+
+        OPTIONAL = {
+            "defusedxml", "docx", "odfdo", "pandas", "pypdf", "pypdfium2",
+            "transformers", "unstructured", "webvtt",
+        }
+
+        class BlockOptional(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                if fullname.split(".")[0] in OPTIONAL:
+                    raise ModuleNotFoundError(fullname)
+                return None
+
+        sys.meta_path.insert(0, BlockOptional())
+
+        from graphon.dsl import loads
+        from graphon.engine_events.graph import GraphRunSucceededEvent
+
+        dsl = '''
+        kind: graph
+        graph:
+          nodes:
+            - id: start
+              data: {type: start, variables: []}
+            - id: answer
+              data: {type: answer, answer: "Hello {{#start.name#}}"}
+          edges:
+            - {source: start, target: answer}
+        '''
+        engine = loads(dsl, start_inputs={"name": "Graphon"}, workers=0)
+        terminal = list(engine.run())[-1]
+        assert isinstance(terminal, GraphRunSucceededEvent), terminal
+        assert terminal.outputs["answer"] == "Hello Graphon"
+        """
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)  # ruff: ignore[subprocess-without-shell-equals-true]

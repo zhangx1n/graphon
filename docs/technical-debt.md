@@ -47,16 +47,17 @@ and [extractor](../tests/nodes/parameter_extractor/test_prompts.py) behavior.
 
 ## TD-07 — Optional capability dependencies
 
-Document-extraction packages are mandatory in [pyproject.toml](../pyproject.toml),
-and [the extractor](../src/graphon/nodes/document_extractor/node.py) imports several
-eagerly. Minimal engine consumers inherit these dependencies, including the Python
-upper bound tied to `unstructured`. No size or startup benefit has been measured.
-
-Consider one document-extraction extra within the existing distribution. Isolate
-its imports, provide an actionable missing-extra error, retain a fully equipped
-development environment, and document the installation transition. Evaluate the
+Document-extraction packages and the Transformers
 [tokenizer fallback](../src/graphon/model_runtime/model_providers/base/tokenizers/gpt2_tokenizer.py)
-separately if needed.
+are now the `documents` and `transformers` extras in [pyproject.toml](../pyproject.toml);
+the development group installs both. Core installs support Python 3.14, where
+`unstructured` formats are unavailable. A [fresh-process test](../tests/runtime/test_runtime_imports.py)
+runs the DSL with those packages blocked.
+
+Remaining: [the extractor](../src/graphon/nodes/document_extractor/node.py) still
+imports its packages eagerly, so importing it without the extra fails with a raw
+`ModuleNotFoundError` instead of an actionable missing-extra error, and the
+installation transition is not yet documented for users.
 
 **Completion:** a clean base-only installation executes a minimal graph; the full
 extra passes [extractor tests](../tests/nodes/document_extractor/) and package/lockfile
