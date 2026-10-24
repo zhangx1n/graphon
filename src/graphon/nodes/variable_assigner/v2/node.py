@@ -135,7 +135,9 @@ class VariableAssignerNode(Node[VariableAssignerNodeData]):
 
     @override
     def _run(self) -> Generator[NodeEventPayload, None, None]:
-        inputs = self.node_data.model_dump()
+        # Graph.init stamps the engine-owned container_id on every node's data;
+        # the recorded inputs stay the node's own configuration.
+        inputs = self.node_data.model_dump(exclude={"container_id"})
         process_data: dict[str, Any] = {}
         # NOTE: This node has no outputs
         updated_variable_selectors: list[Sequence[str]] = []

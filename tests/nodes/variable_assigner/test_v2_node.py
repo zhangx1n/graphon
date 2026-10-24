@@ -27,6 +27,7 @@ def _build_node(
     *,
     variable_pool: VariablePool,
     items: Sequence[VariableOperationItem],
+    container_id: str | None = None,
 ) -> VariableAssignerNode:
     graph_config = {"nodes": [], "edges": []}
     init_params = build_init_params(graph_config=graph_config)
@@ -44,6 +45,7 @@ def _build_node(
             title="Variable Assigner",
             version="2",
             items=items,
+            **({} if container_id is None else {"container_id": container_id}),
         ),
     )
     node.bind_execution_id("assigner-run")
@@ -76,6 +78,35 @@ def test_remove_first_from_array() -> None:
         event for event in events if isinstance(event, NodeRunVariableUpdatedEvent)
     )
     assert updated_event.variable.value == ["second", "third"]
+
+
+def test_inputs_leave_out_the_engine_container_id() -> None:
+    conversation_variable = StringVariable(
+        name="stored",
+        value="before",
+        selector=["conversation", "stored"],
+    )
+    node = _build_node(
+        variable_pool=build_variable_pool(
+            conversation_variables=[conversation_variable]
+        ),
+        items=[
+            VariableOperationItem(
+                variable_selector=["conversation", "stored"],
+                input_type=InputType.CONSTANT,
+                operation=Operation.OVER_WRITE,
+                value="after",
+            ),
+        ],
+        container_id="",
+    )
+
+    succeeded = next(
+        event for event in node.run() if isinstance(event, NodeRunSucceededEvent)
+    )
+
+    assert "container_id" not in succeeded.node_run_result.inputs
+    assert succeeded.node_run_result.inputs["items"][0]["value"] == "after"
 
 
 def test_remove_last_from_array() -> None:
